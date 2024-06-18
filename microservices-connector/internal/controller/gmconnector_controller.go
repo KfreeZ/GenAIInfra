@@ -70,7 +70,68 @@ const (
 // GMConnectorReconciler reconciles a GMConnector object
 type GMConnectorReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme         *runtime.Scheme
+	ServicesStatus map[serviceIndex]bool
+	graphHandle    *mcv1alpha3.GMConnector
+
+	totalService    int
+	externalService int
+	successService  int
+}
+
+func (r *GMConnectorReconciler) getStatus(svc serviceIndex) bool {
+	// Implement the logic to get the status of the service.
+	// Return true if the service is active, false otherwise.
+	service := &corev1.Service{}
+	err := r.Get(context.Background(), client.ObjectKey{Namespace: svc.ns, Name: svc.name}, service)
+	if err != nil {
+		fmt.Printf("Failed to get service %s@%s: %v\n", svc.name, svc.ns, err)
+		return false
+	}
+	deployment := &appsv1.Deployment{}
+	err = r.Get(context.Background(), client.ObjectKey{Namespace: svc.ns, Name: svc.deploymentName}, deployment)
+	if err != nil {
+		fmt.Printf("Failed to get deployment %s@%s: %v\n", svc.deploymentName, svc.ns, err)
+		return false
+	}
+	if getServiceURL(service) != "" && deployment.Status.Conditions[len(deployment.Status.Conditions)-1].Status == corev1.ConditionTrue {
+		return true
+	} else {
+		return false
+	}
+}
+
+func (r *GMConnectorReconciler) startWatching(graph *mcv1alpha3.GMConnector) {
+	r.graphHandle = graph
+	go func() {
+		for {
+			time.Sleep(5 * time.Second)
+			//if statChanged >0 means there are service become active, if <0 means some service died
+			statChanged := 0
+			for svc, status := range r.ServicesStatus {
+				newStatus := r.getStatus(svc)
+				if status != newStatus {
+					if newStatus {
+						statChanged++
+					} else {
+						statChanged--
+					}
+				}
+			}
+			if statChanged != 0 {
+				r.graphHandle.Status.Status = fmt.Sprintf("%d/%d/%d", (r.successService + statChanged), r.externalService, r.totalService)
+				if err := r.Status().Update(context.Background(), r.graphHandle); err != nil {
+					fmt.Printf("Failed to update CR status to %s: %v\n", r.graphHandle.Status.Status, err)
+				}
+			}
+		}
+	}()
+}
+
+type serviceIndex struct {
+	ns             string
+	name           string
+	deploymentName string
 }
 
 type RouterCfg struct {
@@ -111,7 +172,7 @@ func getManifestYaml(step string) string {
 	return tmpltFile
 }
 
-func reconcileResource(ctx context.Context, client client.Client, step string, ns string, svc string, svcCfg *map[string]string, retSvc *corev1.Service) error {
+func reconcileResource(ctx context.Context, client client.Client, step string, ns string, svc string, svcCfg *map[string]string, retSvc *corev1.Service, retDeployment *appsv1.Deployment) error {
 	fmt.Printf("get step %s config for %s@%s: %v\n", step, svc, ns, svcCfg)
 	tmpltFile := getManifestYaml(step)
 	if tmpltFile == "" {
@@ -147,36 +208,37 @@ func reconcileResource(ctx context.Context, client client.Client, step string, n
 					return fmt.Errorf("Failed to save service: %v\n", err)
 				}
 			}
-
-			if createdObj.GetKind() == Deployment && step != Router {
-				var newEnvVars []corev1.EnvVar
-				if svcCfg != nil {
-					for name, value := range *svcCfg {
-						if name == "endpoint" {
-							continue
-						}
-						itemEnvVar := corev1.EnvVar{
-							Name:  name,
-							Value: value,
-						}
-						newEnvVars = append(newEnvVars, itemEnvVar)
-					}
+			if retDeployment != nil && createdObj.GetKind() == Deployment {
+				err = runtime.DefaultUnstructuredConverter.FromUnstructured(createdObj.UnstructuredContent(), retDeployment)
+				if err != nil {
+					return fmt.Errorf("Failed to save deployment: %v\n", err)
 				}
-				if len(newEnvVars) > 0 {
-					deployment := &appsv1.Deployment{}
-					err = runtime.DefaultUnstructuredConverter.FromUnstructured(createdObj.UnstructuredContent(), deployment)
-					if err != nil {
-						return fmt.Errorf("Failed to save deployment: %v\n", err)
+				if step != Router {
+					var newEnvVars []corev1.EnvVar
+					if svcCfg != nil {
+						for name, value := range *svcCfg {
+							if name == "endpoint" {
+								continue
+							}
+							itemEnvVar := corev1.EnvVar{
+								Name:  name,
+								Value: value,
+							}
+							newEnvVars = append(newEnvVars, itemEnvVar)
+						}
 					}
-					for i := range deployment.Spec.Template.Spec.Containers {
-						deployment.Spec.Template.Spec.Containers[i].Env = append(
-							deployment.Spec.Template.Spec.Containers[i].Env,
-							newEnvVars...)
-					}
+					if len(newEnvVars) > 0 {
 
-					// Update the deployment using client.Client
-					if err := client.Update(ctx, deployment); err != nil {
-						return fmt.Errorf("Failed to update deployment: %v\n", err)
+						for i := range retDeployment.Spec.Template.Spec.Containers {
+							retDeployment.Spec.Template.Spec.Containers[i].Env = append(
+								retDeployment.Spec.Template.Spec.Containers[i].Env,
+								newEnvVars...)
+						}
+
+						// Update the deployment using client.Client
+						if err := client.Update(ctx, retDeployment); err != nil {
+							return fmt.Errorf("Failed to update deployment: %v\n", err)
+						}
 					}
 				}
 			}
@@ -253,6 +315,11 @@ func applyRouterConfig(step string, svcCfg *map[string]string, yamlFile []byte) 
 func (r *GMConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	_ = log.FromContext(ctx)
 
+	r.ServicesStatus = make(map[serviceIndex]bool)
+	r.successService = 0
+	r.totalService = 0
+	r.externalService = 0
+
 	graph := &mcv1alpha3.GMConnector{}
 	if err := r.Get(ctx, req.NamespacedName, graph); err != nil {
 		if apierr.IsNotFound(err) {
@@ -271,14 +338,10 @@ func (r *GMConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return reconcile.Result{Requeue: true}, errors.Wrapf(err, "Failed to pre-process the Configmap file for xeon")
 	}
 
-	var totalService uint
-	var externalService uint
-	var successService uint
-
 	for nodeName, node := range graph.Spec.Nodes {
 		for i, step := range node.Steps {
 			fmt.Println("\nreconcile resource for node:", step.StepName)
-			totalService += 1
+			r.totalService += 1
 			if step.Executor.ExternalService == "" {
 				var ns string
 				if step.Executor.InternalService.NameSpace == "" {
@@ -290,18 +353,27 @@ func (r *GMConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				fmt.Println("trying to reconcile internal service [", svcName, "] in namespace ", ns)
 
 				service := &corev1.Service{}
-				err := reconcileResource(ctx, r.Client, step.StepName, ns, svcName, &step.Executor.InternalService.Config, service)
+				deployment := &appsv1.Deployment{}
+				err := reconcileResource(ctx, r.Client, step.StepName, ns, svcName, &step.Executor.InternalService.Config, service, deployment)
 				if err != nil {
 					return reconcile.Result{Requeue: true}, errors.Wrapf(err, "Failed to reconcile service for %s", svcName)
 				}
-				successService += 1
-				graph.Spec.Nodes[nodeName].Steps[i].ServiceURL = getServiceURL(service) + step.Executor.InternalService.Config["endpoint"]
+
+				svcURL := getServiceURL(service)
+				graph.Spec.Nodes[nodeName].Steps[i].ServiceURL = svcURL + step.Executor.InternalService.Config["endpoint"]
 				fmt.Printf("the service URL is: %s\n", graph.Spec.Nodes[nodeName].Steps[i].ServiceURL)
+
+				if svcURL != "" && deployment.Status.Conditions[len(deployment.Status.Conditions)-1].Status == corev1.ConditionTrue {
+					r.ServicesStatus[serviceIndex{service.Namespace, service.Name, deployment.Name}] = true
+					r.successService += 1
+				} else {
+					r.ServicesStatus[serviceIndex{service.Namespace, service.Name, deployment.Name}] = false
+				}
 
 			} else {
 				fmt.Println("external service is found", "name", step.ExternalService)
 				graph.Spec.Nodes[nodeName].Steps[i].ServiceURL = step.ExternalService
-				externalService += 1
+				r.externalService += 1
 			}
 		}
 		fmt.Println()
@@ -311,6 +383,7 @@ func (r *GMConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	//in case the graph changes, we need to apply the changes to router service
 	//so we need to apply the router config every time
 	routerService := &corev1.Service{}
+	routerDeployment := &appsv1.Deployment{}
 	var router_ns string
 	if graph.Spec.RouterConfig.NameSpace == "" {
 		router_ns = req.Namespace
@@ -328,19 +401,30 @@ func (r *GMConnectorReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		graph.Spec.RouterConfig.Config = make(map[string]string)
 	}
 	graph.Spec.RouterConfig.Config["nodes"] = "'" + jsonString + "'"
+	r.totalService += 1
 	//set empty service name, because we don't want to change router service name and deployment name
-	err = reconcileResource(ctx, r.Client, graph.Spec.RouterConfig.Name, router_ns, graph.Spec.RouterConfig.ServiceName, &graph.Spec.RouterConfig.Config, routerService)
+	err = reconcileResource(ctx, r.Client, graph.Spec.RouterConfig.Name, router_ns, graph.Spec.RouterConfig.ServiceName, &graph.Spec.RouterConfig.Config, routerService, routerDeployment)
 	if err != nil {
 		return reconcile.Result{Requeue: true}, errors.Wrapf(err, "Failed to reconcile router service")
 	}
-
-	graph.Status.AccessURL = getServiceURL(routerService)
+	routerURL := getServiceURL(routerService)
+	graph.Status.AccessURL = routerURL
 	fmt.Printf("the router service URL is: %s\n", graph.Status.AccessURL)
 
-	graph.Status.Status = fmt.Sprintf("%d/%d/%d", successService, externalService, totalService)
+	if routerURL != "" && routerDeployment.Status.Conditions[len(routerDeployment.Status.Conditions)-1].Status == corev1.ConditionTrue {
+		r.ServicesStatus[serviceIndex{routerService.Namespace, routerService.Name, routerDeployment.Name}] = true
+		r.successService += 1
+	} else {
+		r.ServicesStatus[serviceIndex{routerService.Namespace, routerService.Name, routerDeployment.Name}] = false
+	}
+
+	graph.Status.Status = fmt.Sprintf("%d/%d/%d", r.successService, r.externalService, r.totalService)
 	if err = r.Status().Update(context.TODO(), graph); err != nil {
 		return reconcile.Result{Requeue: true}, errors.Wrapf(err, "Failed to Update CR status to %s", graph.Status.Status)
 	}
+
+	r.startWatching(graph)
+
 	return ctrl.Result{}, nil
 }
 
@@ -675,7 +759,7 @@ func (r *GMConnectorReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			fmt.Printf("\nspec changed %t | meta changed: %t\n", specChanged, metadataChanged)
 
 			// Compare the old and new spec and metadata, ignore status changes
-			return specChanged || metadataChanged
+			return specChanged
 		},
 		// Other funcs like CreateFunc, DeleteFunc, GenericFunc can be left as default
 		// if you only want to customize the UpdateFunc behavior.
